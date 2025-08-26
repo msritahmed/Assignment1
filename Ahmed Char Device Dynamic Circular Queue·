@@ -1,0 +1,489 @@
+/*
+Files included in this single text document:
+
+1) ahmed_queue.c       -> Kernel character device module (creates /dev/ahmed)
+2) Makefile            -> To build the kernel module
+3) include/ahmed_ioctl.h -> Shared IOCTL definitions (also included in userspace apps)
+4) userspace/configurator.c  -> sets queue size using IOCTL
+5) userspace/filler.c        -> pushes data into device using IOCTL
+6) userspace/reader.c        -> pops data from device using IOCTL (blocking)
+7) README.md           -> build & run instructions
+
+Save files to a git repo with the same layout. Build the kernel module with `make` and the user apps with `gcc`.
+
+DEVICE NAME: /dev/ahmed
+
+Notes:
+- The queue is a byte-level circular buffer with head/tail/count.
+- SET_SIZE_OF_QUEUE must be called before pushing/popping. If called when queue contains data, it will fail with -EBUSY.
+- PUSH_DATA blocks when there's not enough free space. POP_DATA blocks when no data is available.
+- IOCTL struct `struct data_user` uses a user-space pointer to the data buffer. The kernel copies to/from that buffer safely.
+
+*/
+
+/* ----------------- include/ahmed_ioctl.h ----------------- */
+#ifndef _AHMED_IOCTL_H_
+#define _AHMED_IOCTL_H_
+
+#include <linux/ioctl.h>
+
+#define DEVICE_NAME "/dev/ahmed"
+
+/* IOCTL numbers matching the user's example style */
+#define SET_SIZE_OF_QUEUE _IOW('a', 'a', int *)
+#define PUSH_DATA         _IOW('a', 'b', struct data_user *)
+#define POP_DATA          _IOR('a', 'c', struct data_user *)
+
+/* userspace-visible structure (in userspace include this header too)
+   Note: kernel side will interpret the pointer as user-space pointer
+*/
+struct data_user {
+    int length;    /* requested length (for POP) or actual length (for PUSH) */
+    char *data;    /* user-space pointer to buffer */
+};
+
+#endif /* _AHMED_IOCTL_H_ */
+
+/* ----------------- ahmed_queue.c (kernel module) ----------------- */
+
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/fs.h>
+#include <linux/cdev.h>
+#include <linux/device.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/mutex.h>
+#include <linux/wait.h>
+#include <linux/sched.h>
+#include <linux/ioctl.h>
+
+#include "include/ahmed_ioctl.h"
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Ahmed");
+MODULE_DESCRIPTION("Dynamic circular queue char device (blocking) /dev/ahmed");
+
+static dev_t dev_num;
+static struct cdev ahmed_cdev;
+static struct class *ahmed_class;
+
+/* Queue representation */
+static char *queue_buf;
+static size_t queue_size;
+static size_t head, tail, count; /* head==read index, tail==write index */
+static DEFINE_MUTEX(queue_lock);
+static DECLARE_WAIT_QUEUE_HEAD(readq);  /* waiters for data to read */
+static DECLARE_WAIT_QUEUE_HEAD(writeq); /* waiters for space to write */
+
+/* Helper: free space and available data */
+static inline size_t q_free_space(void) {
+    return queue_size - count;
+}
+static inline size_t q_avail_data(void) {
+    return count;
+}
+
+/* File ops prototypes */
+static int ahmed_open(struct inode *inode, struct file *file) { return 0; }
+static int ahmed_release(struct inode *inode, struct file *file) { return 0; }
+static long ahmed_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
+
+static const struct file_operations ahmed_fops = {
+    .owner = THIS_MODULE,
+    .open = ahmed_open,
+    .release = ahmed_release,
+    .unlocked_ioctl = ahmed_ioctl,
+};
+
+/* SET_SIZE_OF_QUEUE implementation */
+static long do_set_size(int __user *user_ptr) {
+    int new_size;
+    if (copy_from_user(&new_size, user_ptr, sizeof(new_size)))
+        return -EFAULT;
+    if (new_size <= 0)
+        return -EINVAL;
+
+    mutex_lock(&queue_lock);
+    if (queue_buf && count != 0) {
+        /* if queue exists and contains data, don't resize */
+        mutex_unlock(&queue_lock);
+        return -EBUSY;
+    }
+
+    /* free old buffer if any */
+    if (queue_buf) {
+        kfree(queue_buf);
+        queue_buf = NULL;
+    }
+
+    queue_buf = kmalloc(new_size, GFP_KERNEL);
+    if (!queue_buf) {
+        mutex_unlock(&queue_lock);
+        return -ENOMEM;
+    }
+    queue_size = new_size;
+    head = tail = count = 0;
+    mutex_unlock(&queue_lock);
+    wake_up_interruptible(&writeq); /* space available */
+    return 0;
+}
+
+/* Copy helper: write 'len' bytes from user buffer into queue (may block before space available) */
+static long queue_push_from_user(const char __user *ubuf, int len) {
+    int ret = 0;
+    int written = 0;
+
+    while (written < len) {
+        /* Wait for free space */
+        ret = wait_event_interruptible(writeq, q_free_space() > 0);
+        if (ret)
+            return -ERESTARTSYS; /* signal interrupted */
+
+        mutex_lock(&queue_lock);
+        if (!queue_buf || queue_size == 0) {
+            mutex_unlock(&queue_lock);
+            return -ENODEV;
+        }
+        /* how many bytes we can write in this iteration */
+        size_t free = q_free_space();
+        size_t want = len - written;
+        size_t w = min(free, want);
+        /* write possibly in two segments because of wrap-around */
+        size_t first_chunk = min(w, queue_size - tail);
+        if (copy_from_user(queue_buf + tail, ubuf + written, first_chunk)) {
+            mutex_unlock(&queue_lock);
+            return -EFAULT;
+        }
+        tail = (tail + first_chunk) % queue_size;
+        count += first_chunk;
+        written += first_chunk;
+
+        if (first_chunk < w) {
+            size_t second_chunk = w - first_chunk;
+            if (copy_from_user(queue_buf + tail, ubuf + written, second_chunk)) {
+                mutex_unlock(&queue_lock);
+                return -EFAULT;
+            }
+            tail = (tail + second_chunk) % queue_size;
+            count += second_chunk;
+            written += second_chunk;
+        }
+
+        mutex_unlock(&queue_lock);
+        wake_up_interruptible(&readq); /* data available */
+    }
+    return 0;
+}
+
+/* Copy helper: pop up to 'len' bytes to user buffer (blocks if no data)
+   On return, writes actual bytes read into *actual_read if provided.
+*/
+static long queue_pop_to_user(char __user *ubuf, int len, int *actual_read) {
+    int ret = 0;
+    int read = 0;
+
+    while (read < len) {
+        ret = wait_event_interruptible(readq, q_avail_data() > 0);
+        if (ret)
+            return -ERESTARTSYS;
+
+        mutex_lock(&queue_lock);
+        if (!queue_buf || queue_size == 0) {
+            mutex_unlock(&queue_lock);
+            return -ENODEV;
+        }
+
+        size_t avail = q_avail_data();
+        size_t want = len - read;
+        size_t r = min(avail, want);
+        size_t first_chunk = min(r, queue_size - head);
+        if (copy_to_user(ubuf + read, queue_buf + head, first_chunk)) {
+            mutex_unlock(&queue_lock);
+            return -EFAULT;
+        }
+        head = (head + first_chunk) % queue_size;
+        count -= first_chunk;
+        read += first_chunk;
+
+        if (first_chunk < r) {
+            size_t second_chunk = r - first_chunk;
+            if (copy_to_user(ubuf + read, queue_buf + head, second_chunk)) {
+                mutex_unlock(&queue_lock);
+                return -EFAULT;
+            }
+            head = (head + second_chunk) % queue_size;
+            count -= second_chunk;
+            read += second_chunk;
+        }
+
+        mutex_unlock(&queue_lock);
+        wake_up_interruptible(&writeq); /* space available */
+
+        /* if we read something, break only if caller asked for only available bytes
+           otherwise continue until requested len satisfied */
+        if (q_avail_data() == 0 && read > 0)
+            break;
+    }
+
+    if (actual_read)
+        *actual_read = read;
+    return 0;
+}
+
+static long ahmed_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
+    long ret = -EINVAL;
+    switch (cmd) {
+        case SET_SIZE_OF_QUEUE:
+            ret = do_set_size((int __user *)arg);
+            break;
+
+        case PUSH_DATA: {
+            /* copy struct from user to get length and user pointer */
+            struct data_user kdu;
+            if (copy_from_user(&kdu, (void __user *)arg, sizeof(kdu))) {
+                ret = -EFAULT;
+                break;
+            }
+            if (kdu.length <= 0 || !kdu.data) {
+                ret = -EINVAL;
+                break;
+            }
+            /* push the bytes from user-space pointer */
+            ret = queue_push_from_user((const char __user *)kdu.data, kdu.length);
+            break;
+        }
+        case POP_DATA: {
+            /* user passes struct with length and buffer pointer; kernel should copy up to length bytes
+               and then update struct.length to actual read count. */
+            struct data_user kdu;
+            if (copy_from_user(&kdu, (void __user *)arg, sizeof(kdu))) {
+                ret = -EFAULT;
+                break;
+            }
+            if (kdu.length <= 0 || !kdu.data) {
+                ret = -EINVAL;
+                break;
+            }
+            {
+                int actual = 0;
+                ret = queue_pop_to_user((char __user *)kdu.data, kdu.length, &actual);
+                if (ret == 0) {
+                    /* update the length field to actual bytes read */
+                    kdu.length = actual;
+                    if (copy_to_user((void __user *)arg, &kdu, sizeof(kdu)))
+                        ret = -EFAULT;
+                }
+            }
+            break;
+        }
+        default:
+            ret = -ENOTTY;
+            break;
+    }
+    return ret;
+}
+
+static int __init ahmed_init(void) {
+    int ret;
+
+    ret = alloc_chrdev_region(&dev_num, 0, 1, "ahmed_char");
+    if (ret) {
+        pr_err("failed to alloc chrdev region\n");
+        return ret;
+    }
+    cdev_init(&ahmed_cdev, &ahmed_fops);
+    ahmed_cdev.owner = THIS_MODULE;
+    ret = cdev_add(&ahmed_cdev, dev_num, 1);
+    if (ret) {
+        pr_err("cdev_add failed\n");
+        unregister_chrdev_region(dev_num, 1);
+        return ret;
+    }
+    ahmed_class = class_create(THIS_MODULE, "ahmed_class");
+    if (IS_ERR(ahmed_class)) {
+        pr_err("class_create failed\n");
+        cdev_del(&ahmed_cdev);
+        unregister_chrdev_region(dev_num, 1);
+        return PTR_ERR(ahmed_class);
+    }
+
+    if (!device_create(ahmed_class, NULL, dev_num, NULL, "ahmed")) {
+        pr_info("created /dev/ahmed\n");
+    }
+
+    queue_buf = NULL;
+    queue_size = 0;
+    head = tail = count = 0;
+
+    pr_info("ahmed char device initialized\n");
+    return 0;
+}
+
+static void __exit ahmed_exit(void) {
+    if (queue_buf) {
+        kfree(queue_buf);
+        queue_buf = NULL;
+    }
+    device_destroy(ahmed_class, dev_num);
+    class_destroy(ahmed_class);
+    cdev_del(&ahmed_cdev);
+    unregister_chrdev_region(dev_num, 1);
+    pr_info("ahmed char device exited\n");
+}
+
+module_init(ahmed_init);
+module_exit(ahmed_exit);
+
+/* ----------------- Makefile ----------------- */
+
+/*
+Simple Makefile to build the kernel module. Place next to ahmed_queue.c
+Usage: make
+*/
+
+/* BEGIN-MAKEFILE */
+obj-m += ahmed_queue.o
+KDIR ?= /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+
+install: all
+	sudo cp ahmed_queue.ko /lib/modules/$(shell uname -r)/extra/ || true
+	sudo depmod -a
+
+/* END-MAKEFILE */
+
+/* ----------------- userspace/configurator.c ----------------- */
+
+/* Compile: gcc -o configurator configurator.c */
+#include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <stdlib.h>
+#include "../include/ahmed_ioctl.h"
+
+int main(int argc, char **argv) {
+    int fd = open("/dev/ahmed", O_RDWR);
+    if (fd < 0) {
+        perror("open");
+        return 1;
+    }
+    int size = 1024; /* default queue size */
+    if (argc >= 2) size = atoi(argv[1]);
+
+    int ret = ioctl(fd, SET_SIZE_OF_QUEUE, &size);
+    if (ret < 0)
+        perror("ioctl(SET_SIZE_OF_QUEUE)");
+    else
+        printf("queue size set to %d\n", size);
+    close(fd);
+    return ret < 0 ? 1 : 0;
+}
+
+/* ----------------- userspace/filler.c ----------------- */
+
+/* Compile: gcc -o filler filler.c */
+#include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <stdlib.h>
+#include <string.h>
+#include "../include/ahmed_ioctl.h"
+
+int main(int argc, char **argv) {
+    int fd = open("/dev/ahmed", O_RDWR);
+    if (fd < 0) { perror("open"); return 1; }
+
+    const char *msg = "hello-ahmed";
+    if (argc >= 2) msg = argv[1];
+    int len = strlen(msg);
+
+    struct data_user d;
+    d.length = len;
+    d.data = (char *)msg; /* user-space pointer */
+
+    int ret = ioctl(fd, PUSH_DATA, &d);
+    if (ret < 0) perror("ioctl(PUSH_DATA)");
+    else printf("pushed %d bytes\n", len);
+    close(fd);
+    return ret < 0 ? 1 : 0;
+}
+
+/* ----------------- userspace/reader.c ----------------- */
+
+/* Compile: gcc -o reader reader.c */
+#include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <stdlib.h>
+#include <string.h>
+#include "../include/ahmed_ioctl.h"
+
+int main(int argc, char **argv) {
+    int fd = open("/dev/ahmed", O_RDWR);
+    if (fd < 0) { perror("open"); return 1; }
+
+    int req = 512;
+    if (argc >= 2) req = atoi(argv[1]);
+    char *buf = malloc(req);
+    if (!buf) { perror("malloc"); close(fd); return 1; }
+    memset(buf, 0, req);
+    struct data_user d;
+    d.length = req;
+    d.data = buf;
+
+    printf("waiting to POP up to %d bytes (blocking)\n", req);
+    int ret = ioctl(fd, POP_DATA, &d);
+    if (ret < 0) perror("ioctl(POP_DATA)");
+    else printf("popped %d bytes: '%.*s'\n", d.length, d.length, buf);
+
+    free(buf);
+    close(fd);
+    return ret < 0 ? 1 : 0;
+}
+
+/* ----------------- README.md ----------------- */
+
+/*
+README - Dynamic Circular Queue Char Device (/dev/ahmed)
+
+Files:
+- include/ahmed_ioctl.h   : IOCTL definitions and shared struct
+- ahmed_queue.c           : Kernel module source
+- Makefile                : build kernel module
+- userspace/configurator.c: sets queue size: ./configurator <size>
+- userspace/filler.c      : pushes data: ./filler "some text"
+- userspace/reader.c      : pops data (blocking): ./reader <max_bytes>
+
+Build & install kernel module:
+  1. make
+  2. sudo insmod ahmed_queue.ko
+  3. ls -l /dev/ahmed   (device node should be created by module)
+
+If device node is not present, create it manually (get major/minor from dmesg or /proc/devices):
+  sudo mknod /dev/ahmed c $(awk '\$2=="ahmed_char"{print $1}' /proc/misc 2>/dev/null) 0
+
+Userspace build (from userspace/ directory):
+  gcc -o configurator configurator.c
+  gcc -o filler filler.c
+  gcc -o reader reader.c
+
+Usage example:
+  sudo ./configurator 256       # set queue to 256 bytes
+  ./filler "hello world"       # pushes data (blocks if not enough space)
+  ./reader 64                   # pops up to 64 bytes (blocks if no data)
+
+Notes:
+- The kernel module blocks readers when no data is available and blocks writers when buffer is full.
+- SET_SIZE_OF_QUEUE must be called (and queue must be empty) before push/pop operations.
+
+*/
